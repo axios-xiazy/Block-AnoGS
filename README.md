@@ -1,4 +1,4 @@
-# 🔥 block-anogs.hpp - Anti-Cheat Bypass
+# 🔥 Anti-Cheat Bypass
 
 ---
 

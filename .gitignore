@@ -1,0 +1,22 @@
+# Build output
+build/
+covbuild/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# Coverage artifacts
+*.gcda
+*.gcno
+*.info
+
+# Compiled objects / binaries
+*.o
+*.a
+*.so
+block_anogs_tests

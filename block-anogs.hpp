@@ -46,6 +46,17 @@
     constexpr int NR_MEMFD_CREATE = 385;
     constexpr int NR_SECCOMP = 383;
     constexpr int NR_GETDENTS64 = 141;
+#elif defined(__x86_64__)
+    constexpr int NR_OPENAT = 257;
+    constexpr int NR_OPENAT2 = 437;
+    constexpr int NR_EXECVE = 59;
+    constexpr int NR_EXECVEAT = 322;
+    constexpr int NR_PTRACE = 101;
+    constexpr int NR_PROCESS_VM_WRITEV = 311;
+    constexpr int NR_PROCESS_VM_READV = 310;
+    constexpr int NR_MEMFD_CREATE = 319;
+    constexpr int NR_SECCOMP = 317;
+    constexpr int NR_GETDENTS64 = 217;
 #else
     #error "Unsupported architecture"
 #endif
@@ -182,11 +193,14 @@ inline void sigTrapHandler(int sig, siginfo_t* info, void* context) {
 
     if (!nuke::blocked) return;
 
-    ucontext_t* uc = static_cast<ucontext_t*>(context);
 #if defined(__arm__)
+    ucontext_t* uc = static_cast<ucontext_t*>(context);
     uc->uc_mcontext.arm_pc += 4;
 #elif defined(__aarch64__)
+    ucontext_t* uc = static_cast<ucontext_t*>(context);
     uc->uc_mcontext.pc += 4;
+#else
+    (void)context;
 #endif
 }
 

@@ -21,6 +21,7 @@
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <sys/time.h>
+#include <atomic>
 
 #if defined(__aarch64__)
     constexpr int NR_OPENAT = 56;
@@ -58,8 +59,8 @@ constexpr size_t PAGE_SIZE = 4096;
 
 namespace nuke {
     inline volatile sig_atomic_t blocked = 0;
-    inline void* lib_base = nullptr;
-    inline size_t lib_size = 0;
+    inline std::atomic<void*> lib_base{nullptr};
+    inline std::atomic<size_t> lib_size{0};
     inline struct link_map* lm = nullptr;
     inline std::vector<int> dummy_fds;
 }
@@ -83,11 +84,11 @@ inline std::string getLibraryPath(const std::string& name) {
     return "";
 }
 
-inline void getLibraryInfo(const std::string& name, void** base, size_t* size) {
+inline void getLibraryInfo(const std::string& name, std::atomic<void*>& base, std::atomic<size_t>& size) {
     std::ifstream maps("/proc/self/maps");
     std::string line;
-    *base = nullptr;
-    *size = 0;
+    base.store(nullptr, std::memory_order_relaxed);
+    size.store(0, std::memory_order_relaxed);
     
     unsigned long first_start = 0;
     unsigned long last_end = 0;
@@ -110,8 +111,8 @@ inline void getLibraryInfo(const std::string& name, void** base, size_t* size) {
     }
     
     if (found) {
-        *base = reinterpret_cast<void*>(first_start);
-        *size = last_end - first_start;
+        base.store(reinterpret_cast<void*>(first_start), std::memory_order_relaxed);
+        size.store(last_end - first_start, std::memory_order_relaxed);
     }
 }
 
@@ -190,12 +191,18 @@ inline void exhaustFileDescriptors() {
 }
 
 inline void installGuardPages() {
-    if (!nuke::lib_base || !nuke::lib_size) return;
+    void* base = nuke::lib_base.load(std::memory_order_acquire);
+    size_t sz = nuke::lib_size.load(std::memory_order_acquire);
+    if (!base || !sz) return;
     
-    unsigned char* end = static_cast<unsigned char*>(nuke::lib_base) + nuke::lib_size;
+    unsigned char* end = static_cast<unsigned char*>(base) + sz;
     end = reinterpret_cast<unsigned char*>((reinterpret_cast<unsigned long>(end) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
     
-    mmap(end, PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    void* guard = mmap(end, PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (guard == MAP_FAILED) return;
+    if (guard != end) {
+        munmap(guard, PAGE_SIZE);
+    }
 }
 
 inline void installSeccompFilter() {
@@ -257,28 +264,34 @@ inline void installSeccompFilter() {
 }
 
 inline void destroyElfHeaders() {
-    if (!nuke::lib_base) return;
+    void* base = nuke::lib_base.load(std::memory_order_acquire);
+    if (!base) return;
     
-    mprotect(nuke::lib_base, PAGE_SIZE, PROT_READ | PROT_WRITE);
-    memset(nuke::lib_base, 0, ELF_HEADER_SIZE);
+    if (mprotect(base, PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) return;
+    memset(base, 0, ELF_HEADER_SIZE);
     
     unsigned char fake_elf[] = {0x7f, 'E', 'L', 'F', 0, 0, 0, 0};
-    memcpy(nuke::lib_base, fake_elf, 8);
+    memcpy(base, fake_elf, 8);
     
-    mprotect(nuke::lib_base, PAGE_SIZE, PROT_READ);
+    mprotect(base, PAGE_SIZE, PROT_READ);
 }
 
 inline void hideSectionHeaders() {
-    if (!nuke::lib_base) return;
+    void* base = nuke::lib_base.load(std::memory_order_acquire);
+    if (!base) return;
     
-    Elf64_Ehdr* ehdr = static_cast<Elf64_Ehdr*>(nuke::lib_base);
+#if defined(__aarch64__)
+    Elf64_Ehdr* ehdr = static_cast<Elf64_Ehdr*>(base);
+#elif defined(__arm__)
+    Elf32_Ehdr* ehdr = static_cast<Elf32_Ehdr*>(base);
+#endif
     if (!ehdr->e_shoff) return;
     
-    mprotect(nuke::lib_base, PAGE_SIZE, PROT_READ | PROT_WRITE);
+    if (mprotect(base, PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) return;
     ehdr->e_shoff = 0;
     ehdr->e_shnum = 0;
     ehdr->e_shstrndx = 0;
-    mprotect(nuke::lib_base, PAGE_SIZE, PROT_READ);
+    mprotect(base, PAGE_SIZE, PROT_READ);
 }
 
 inline void installWatchdog(const std::string& name) {
@@ -311,11 +324,9 @@ inline void lockFilePermissions(const std::string& path) {
 
 inline void setupAntiDebug() {
     prctl(PR_SET_DUMPABLE, 0);
-    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
     
     struct rlimit rl = {0, 0};
     setrlimit(RLIMIT_CORE, &rl);
-    setrlimit(RLIMIT_NPROC, &rl);
     
     preventPtrace();
     setupSignalHandlers();
@@ -328,13 +339,15 @@ inline void nukeLibrary(const std::string& name) {
         if (path.empty()) usleep(1000);
     } while (path.empty());
     
-    getLibraryInfo(name, &nuke::lib_base, &nuke::lib_size);
+    getLibraryInfo(name, nuke::lib_base, nuke::lib_size);
     lockFilePermissions(path);
     
     nuke::blocked = 1;
     
-    if (nuke::lib_base && nuke::lib_size) {
-        mlock(nuke::lib_base, nuke::lib_size);
+    void* base = nuke::lib_base.load(std::memory_order_acquire);
+    size_t sz = nuke::lib_size.load(std::memory_order_acquire);
+    if (base && sz) {
+        mlock(base, sz);
     }
     
     destroyElfHeaders();
@@ -349,4 +362,7 @@ inline void nukeLibrary(const std::string& name) {
     
     std::thread([path]() { slowFileRead(path); }).detach();
     installWatchdog(name);
+    
+    struct rlimit rl_nproc = {0, 0};
+    setrlimit(RLIMIT_NPROC, &rl_nproc);
 }

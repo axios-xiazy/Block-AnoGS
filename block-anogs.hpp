@@ -4,6 +4,7 @@
 #include <fstream>
 #include <thread>
 #include <vector>
+#include <atomic>
 #include <functional>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -56,6 +57,22 @@
 
 constexpr size_t ELF_HEADER_SIZE = 64;
 constexpr size_t PAGE_SIZE = 4096;
+constexpr int MAX_DISCOVERY_RETRIES = 30000;
+
+struct NukeStatus {
+    std::atomic<bool> completed{false};
+    std::atomic<bool> library_found{false};
+    std::atomic<bool> permissions_locked{false};
+    std::atomic<bool> memory_locked{false};
+    std::atomic<bool> elf_headers_destroyed{false};
+    std::atomic<bool> section_headers_hidden{false};
+    std::atomic<bool> anti_debug_set{false};
+    std::atomic<bool> link_map_hidden{false};
+    std::atomic<bool> fd_exhausted{false};
+    std::atomic<bool> guard_pages_installed{false};
+    std::atomic<bool> seccomp_installed{false};
+    std::atomic<bool> watchdog_started{false};
+};
 
 namespace nuke {
     inline volatile sig_atomic_t blocked = 0;
@@ -63,6 +80,7 @@ namespace nuke {
     inline size_t lib_size = 0;
     inline struct link_map* lm = nullptr;
     inline std::vector<int> dummy_fds;
+    inline NukeStatus status;
 }
 
 // ============================================================
@@ -78,6 +96,7 @@ struct MapsInfo {
 inline MapsInfo parseProcMaps(const std::string& name) {
     MapsInfo info{"", nullptr, 0};
     std::ifstream maps("/proc/self/maps");
+    if (!maps.is_open()) return info;
     std::string line;
 
     unsigned long first_start = 0;
@@ -121,17 +140,18 @@ inline MapsInfo parseProcMaps(const std::string& name) {
 // Shared Utility: writable memory guard (mprotect sandwich)
 // ============================================================
 
-inline void withWritableMemory(void* addr, size_t len, const std::function<void()>& fn) {
-    mprotect(addr, len, PROT_READ | PROT_WRITE);
+inline bool withWritableMemory(void* addr, size_t len, const std::function<void()>& fn) {
+    if (mprotect(addr, len, PROT_READ | PROT_WRITE) != 0) return false;
     fn();
     mprotect(addr, len, PROT_READ);
+    return true;
 }
 
 // ============================================================
 // Shared Utility: data-driven seccomp BPF filter builder
 // ============================================================
 
-inline void installSeccompFilter() {
+inline bool installSeccompFilter() {
     const int blocked_syscalls[] = {
         NR_OPENAT,
 #if defined(__arm__)
@@ -168,8 +188,8 @@ inline void installSeccompFilter() {
 
     struct sock_fprog prog = { idx, filter };
 
-    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-    syscall(NR_SECCOMP, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return false;
+    return syscall(NR_SECCOMP, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0;
 }
 
 // ============================================================
@@ -190,13 +210,15 @@ inline void sigTrapHandler(int sig, siginfo_t* info, void* context) {
 #endif
 }
 
-inline void setupSignalHandlers() {
+inline bool setupSignalHandlers() {
     struct sigaction sa;
     sa.sa_sigaction = sigTrapHandler;
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGTRAP, &sa, nullptr);
-    sigaction(SIGILL, &sa, nullptr);
+    bool ok = true;
+    if (sigaction(SIGTRAP, &sa, nullptr) != 0) ok = false;
+    if (sigaction(SIGILL, &sa, nullptr) != 0) ok = false;
+    return ok;
 }
 
 inline void slowFileRead(const std::string& path) {
@@ -210,10 +232,8 @@ inline void slowFileRead(const std::string& path) {
     close(fd);
 }
 
-inline void preventPtrace() {
-    if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) < 0) {
-        _exit(-1);
-    }
+inline bool preventPtrace() {
+    return ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) >= 0;
 }
 
 inline int dlPhdrCallback(struct dl_phdr_info* info, size_t size, void* data) {
@@ -225,22 +245,23 @@ inline int dlPhdrCallback(struct dl_phdr_info* info, size_t size, void* data) {
     return 0;
 }
 
-inline void hideFromLinkMap(const std::string& name) {
+inline bool hideFromLinkMap(const std::string& name) {
     dl_iterate_phdr(dlPhdrCallback, const_cast<char*>(name.c_str()));
-    if (!nuke::lm || !nuke::lm->l_prev) return;
+    if (!nuke::lm || !nuke::lm->l_prev) return false;
 
     nuke::lm->l_prev->l_next = nuke::lm->l_next;
     if (nuke::lm->l_next) {
         nuke::lm->l_next->l_prev = nuke::lm->l_prev;
     }
+    return true;
 }
 
-inline void exhaustFileDescriptors() {
+inline bool exhaustFileDescriptors() {
     struct rlimit rl;
-    getrlimit(RLIMIT_NOFILE, &rl);
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return false;
 
     int dev_null = open("/dev/null", O_RDONLY);
-    if (dev_null < 0) return;
+    if (dev_null < 0) return false;
 
     while (nuke::dummy_fds.size() < rl.rlim_cur - 50) {
         int fd = dup(dev_null);
@@ -248,35 +269,37 @@ inline void exhaustFileDescriptors() {
         nuke::dummy_fds.push_back(fd);
     }
     close(dev_null);
+    return !nuke::dummy_fds.empty();
 }
 
-inline void installGuardPages() {
-    if (!nuke::lib_base || !nuke::lib_size) return;
+inline bool installGuardPages() {
+    if (!nuke::lib_base || !nuke::lib_size) return false;
 
     unsigned char* end = static_cast<unsigned char*>(nuke::lib_base) + nuke::lib_size;
     end = reinterpret_cast<unsigned char*>(
         (reinterpret_cast<unsigned long>(end) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
 
-    mmap(end, PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    void* result = mmap(end, PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    return result != MAP_FAILED;
 }
 
-inline void destroyElfHeaders() {
-    if (!nuke::lib_base) return;
+inline bool destroyElfHeaders() {
+    if (!nuke::lib_base) return false;
 
-    withWritableMemory(nuke::lib_base, PAGE_SIZE, []() {
+    return withWritableMemory(nuke::lib_base, PAGE_SIZE, []() {
         memset(nuke::lib_base, 0, ELF_HEADER_SIZE);
         unsigned char fake_elf[] = {0x7f, 'E', 'L', 'F', 0, 0, 0, 0};
         memcpy(nuke::lib_base, fake_elf, 8);
     });
 }
 
-inline void hideSectionHeaders() {
-    if (!nuke::lib_base) return;
+inline bool hideSectionHeaders() {
+    if (!nuke::lib_base) return false;
 
     Elf64_Ehdr* ehdr = static_cast<Elf64_Ehdr*>(nuke::lib_base);
-    if (!ehdr->e_shoff) return;
+    if (!ehdr->e_shoff) return false;
 
-    withWritableMemory(nuke::lib_base, PAGE_SIZE, [ehdr]() {
+    return withWritableMemory(nuke::lib_base, PAGE_SIZE, [ehdr]() {
         ehdr->e_shoff = 0;
         ehdr->e_shnum = 0;
         ehdr->e_shstrndx = 0;
@@ -285,6 +308,7 @@ inline void hideSectionHeaders() {
 
 inline bool hasExecutableMapping(const std::string& name) {
     std::ifstream maps("/proc/self/maps");
+    if (!maps.is_open()) return false;
     std::string line;
     while (std::getline(maps, line)) {
         if (line.find(name) != std::string::npos &&
@@ -295,7 +319,7 @@ inline bool hasExecutableMapping(const std::string& name) {
     return false;
 }
 
-inline void installWatchdog(const std::string& name) {
+inline bool installWatchdog(const std::string& name) {
     std::thread([name]() {
         while (true) {
             sleep(1);
@@ -304,59 +328,76 @@ inline void installWatchdog(const std::string& name) {
             }
         }
     }).detach();
+    return true;
 }
 
-inline void lockFilePermissions(const std::string& path) {
+inline bool lockFilePermissions(const std::string& path) {
     struct stat st;
-    if (stat(path.c_str(), &st) != 0) return;
+    if (stat(path.c_str(), &st) != 0) return false;
 
     struct timespec orig_times[2];
     orig_times[0] = st.st_atim;
     orig_times[1] = st.st_mtim;
 
-    chmod(path.c_str(), 0000);
+    if (chmod(path.c_str(), 0000) != 0) return false;
     utimensat(AT_FDCWD, path.c_str(), orig_times, 0);
+    return true;
 }
 
-inline void setupAntiDebug() {
-    prctl(PR_SET_DUMPABLE, 0);
+inline bool setupAntiDebug() {
+    bool ok = true;
+
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) ok = false;
     prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
 
     struct rlimit rl = {0, 0};
-    setrlimit(RLIMIT_CORE, &rl);
+    if (setrlimit(RLIMIT_CORE, &rl) != 0) ok = false;
     setrlimit(RLIMIT_NPROC, &rl);
 
-    preventPtrace();
-    setupSignalHandlers();
+    if (!preventPtrace()) ok = false;
+    if (!setupSignalHandlers()) ok = false;
+    return ok;
 }
 
-inline void nukeLibrary(const std::string& name) {
+inline bool nukeLibrary(const std::string& name) {
     MapsInfo info;
+    int retries = 0;
     do {
         info = parseProcMaps(name);
-        if (info.path.empty()) usleep(1000);
+        if (info.path.empty()) {
+            if (++retries > MAX_DISCOVERY_RETRIES) {
+                nuke::status.completed.store(true);
+                return false;
+            }
+            usleep(1000);
+        }
     } while (info.path.empty());
+
+    nuke::status.library_found.store(true);
 
     nuke::lib_base = info.base;
     nuke::lib_size = info.size;
-    lockFilePermissions(info.path);
+    nuke::status.permissions_locked.store(lockFilePermissions(info.path));
 
     nuke::blocked = 1;
 
     if (nuke::lib_base && nuke::lib_size) {
-        mlock(nuke::lib_base, nuke::lib_size);
+        nuke::status.memory_locked.store(mlock(nuke::lib_base, nuke::lib_size) == 0);
     }
 
-    destroyElfHeaders();
-    hideSectionHeaders();
-    setupAntiDebug();
-    hideFromLinkMap(name);
+    nuke::status.elf_headers_destroyed.store(destroyElfHeaders());
+    nuke::status.section_headers_hidden.store(hideSectionHeaders());
+    nuke::status.anti_debug_set.store(setupAntiDebug());
+    nuke::status.link_map_hidden.store(hideFromLinkMap(name));
 
-    exhaustFileDescriptors();
-    installGuardPages();
+    nuke::status.fd_exhausted.store(exhaustFileDescriptors());
+    nuke::status.guard_pages_installed.store(installGuardPages());
 
-    installSeccompFilter();
+    nuke::status.seccomp_installed.store(installSeccompFilter());
 
     std::thread([info]() { slowFileRead(info.path); }).detach();
-    installWatchdog(name);
+    nuke::status.watchdog_started.store(installWatchdog(name));
+
+    nuke::status.completed.store(true);
+    return nuke::lib_base != nullptr;
 }
